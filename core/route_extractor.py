@@ -150,13 +150,19 @@ def extract_reroutes(e_text):
 
     # ---------- Style E: VOR adjust "ADJUST TO ... , AND VICE VERSA" ----------
     for vl in re.findall(
-        r"ADJUST\s+TO\s+([^\n\.]+?)(?:,\s*AND\s+VICE\s+VERSA|\.)",
+        r"ADJUST\s+TO\s+([^\n\.]+?)(?:,\s*AND\s+VICE\s+VERSA|\.|$)",
         joined, re.I,
     ):
-        tokens = []
-        for m2 in re.finditer(r"'([A-Z0-9]{2,5})'|\b([A-Z]\d{1,4})\b", vl):
-            tokens.append(m2.group(1) or m2.group(2))
-        wps = _only_waypoints(tokens)
+        quoted = re.findall(r"'([A-Z0-9]{2,5})'|\"([A-Z0-9]{2,5})\"", vl)
+        quoted = [a or b for a, b in quoted]
+
+        if quoted:
+            # Quoted VOR style: use the quoted IDs directly (PLT, SHR)
+            wps = [w for w in quoted if _is_waypoint(w)]
+        else:
+            # Unquoted dash style: OMDEM-V173-TOCEF-KIGUN
+            wps = _only_waypoints(_tokenize(vl))
+
         if len(wps) >= 2:
             results.append({
                 "raw": _clean(vl),
