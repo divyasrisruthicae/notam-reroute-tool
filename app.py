@@ -9,12 +9,10 @@ from core.route_extractor import extract_reroutes
 from core.waypoint_resolver import WaypointResolver
 from core.fir_resolver import FIRResolver
 from core.prefix_resolver import PrefixResolver
-from core.dep_dest_builder import build_dep_dest, build_dep_dest_airway
-from core.airway_graph import AirwayGraph
+from core.dep_dest_builder import build_dep_dest
 
 st.set_page_config(page_title="NOTAM Reroute Tool", layout="wide")
 st.title("✈️ NOTAM Reroute → Dep/Dest FIR Tool")
-
 
 @st.cache_resource
 def load_resources():
@@ -22,49 +20,50 @@ def load_resources():
         WaypointResolver("data/waypoints.csv"),
         FIRResolver("data/fir_boundaries.geojson"),
         PrefixResolver("data/fir_prefix_map.csv"),
-        AirwayGraph("data/waypoints.csv"),
     )
 
+wp_res, fir_res, pfx_res = load_resources()
 
-wp_res, fir_res, pfx_res, awy_graph = load_resources()
+# ---------- Helper: dedup prefixes, keep nearest-first order ----------
+def ordered_prefixes(items, extra_airports):
+    seen = []
+    for it in items:
+        if it["prefix"] and it["prefix"] not in seen:
+            seen.append(it["prefix"])
+    for a in extra_airports:
+        if a and a not in seen:
+            seen.append(a)
+    return seen
 
 # ---------- Sidebar ----------
 with st.sidebar:
     st.header("⚙️ Settings")
 
-    method = st.radio(
-        "Dep/Dest method",
-        ["Airway network (recommended)", "Geometry (fallback)"],
+    dep_side_choice = st.radio(
+        "Which end is 'Dep. Airports'?",
+        ["Route END side (beyond LAST wpt)",
+         "Route START side (beyond FIRST wpt)"],
         index=0,
-        help="Airway network follows real airways from the CSV. "
-             "Geometry uses direction on the map.",
+        help="The route flies FIRST → LAST. Pick which end holds the "
+             "departure airports. The other end becomes destinations.",
     )
 
-    awy_dist = st.slider(
-        "Airway spread distance (km)", 1000, 8000, 3500, 250,
-        help="How far to follow airways outward from each endpoint.",
+    nearest_n = st.slider(
+        "Show nearest FIRs per side", 3, 40, 6, 1,
+        help="Shows only the N closest FIRs first. Expand below to see all.",
     )
 
-    collapse_wild = st.checkbox(
-        "Show collapsed wildcards (V*, Z* ...)", value=True,
-        help="Collapses all reachable FIRs to 1-letter wildcards, "
-             "like the manual FPID format.",
+    max_dist = st.slider(
+        "Max ray distance (km)", 500, 9000, 6000, 250,
+        help="Upper bound only. Nearest-N fills first, so far FIRs rarely show."
+    )
+    min_dist = st.slider("Min ray distance (km)", 0, 1000, 0, 50)
+    corridor = st.slider(
+        "Corridor half-angle (°)", 15, 90, 90, 5,
+        help="90° = everything ahead vs behind (matches manual FPID logic)."
     )
 
-    swap_sides = st.checkbox(
-        "Swap Dep ↔ Dest", value=False,
-        help="Flip if the two sides come out reversed for your convention.",
-    )
-
-    # geometry-only sliders
-    if method.startswith("Geometry"):
-        nearest_n = st.slider("Nearest FIRs per side", 3, 40, 6, 1)
-        max_dist  = st.slider("Max ray distance (km)", 500, 9000, 6000, 250)
-        corridor  = st.slider("Corridor half-angle (°)", 15, 90, 90, 5)
-    else:
-        nearest_n, max_dist, corridor = 6, 6000, 90
-
-    st.caption("Source FIR auto-excluded.")
+    st.caption("Source FIR is auto-excluded. Nearest countries shown first.")
 
 # ---------- State ----------
 if "analysis" not in st.session_state:
@@ -81,28 +80,27 @@ if st.button("🚀 Analyze"):
     notam_id = extract_notam_id(notam_text)
     src_fir  = extract_source_fir(notam_text)
     e_text   = extract_e_section(notam_text)
-    q_coord  = extract_q_coordinate(notam_text)
     reroutes = extract_reroutes(e_text)
-
-    src_prefix = pfx_res.prefix_for_fir(src_fir) if src_fir else None
+    q_coord  = extract_q_coordinate(notam_text)
 
     outputs = []
     for rr in reroutes:
-        out_geo = build_dep_dest(
+        out = build_dep_dest(
             rr, wp_res, fir_res, pfx_res,
-            source_fir=src_fir, anchor_coord=q_coord,
-            max_distance_km=max_dist, min_distance_km=0, corridor_deg=corridor,
+            source_fir=src_fir,
+            anchor_coord=q_coord,
+            max_distance_km=max_dist,
+            min_distance_km=min_dist,
+            corridor_deg=corridor,
         )
-        out_awy = build_dep_dest_airway(
-            rr, awy_graph, source_fir_prefix=src_prefix,
-            max_distance_km=awy_dist,
-        )
-        outputs.append((rr, out_geo, out_awy))
+        outputs.append((rr, out))
 
     st.session_state.analysis = {
-        "notam_id": notam_id, "src_fir": src_fir, "reroutes": outputs,
-        "method": method, "nearest_n": nearest_n,
-        "collapse_wild": collapse_wild, "swap_sides": swap_sides,
+        "notam_id": notam_id,
+        "src_fir": src_fir,
+        "reroutes": outputs,
+        "dep_side_choice": dep_side_choice,
+        "nearest_n": nearest_n,
     }
 
 # ---------- Render ----------
@@ -116,13 +114,10 @@ if analysis:
     if not analysis["reroutes"]:
         st.warning("No reroutes extracted from this NOTAM text.")
 
-    use_airway = analysis["method"].startswith("Airway")
+    dep_is_last = analysis["dep_side_choice"].startswith("Route END")
+    N = analysis["nearest_n"]
 
-    def to_wild(prefixes):
-        letters = sorted({p[0] for p in prefixes if p})
-        return [f"{L}*" for L in letters]
-
-    for i, (rr, out_geo, out_awy) in enumerate(analysis["reroutes"], 1):
+    for i, (rr, out) in enumerate(analysis["reroutes"], 1):
         st.markdown(f"---\n### 🛫 Reroute {i}")
         st.code(rr["raw"])
 
@@ -134,64 +129,94 @@ if analysis:
             else:
                 st.info(f"Closed: **{rr['closed_airway']}**")
 
-        # ----- pick source of Dep/Dest -----
-        if use_airway:
-            if out_awy.get("error"):
-                st.warning(f"⚠️ Airway network: {out_awy['error']} — "
-                           f"showing geometry instead.")
-                dep = out_geo["classification"]["prefixes_first"]
-                dest = out_geo["classification"]["prefixes_last"]
-            else:
-                dep = out_awy["dep_prefixes"]
-                dest = out_awy["dest_prefixes"]
-            first_wpt, last_wpt = out_awy["first_wpt"], out_awy["last_wpt"]
+        if out.get("error") and not out["records"]:
+            st.error(f"❌ {out['error']}. Missing: {out['missing_waypoints']}")
+            continue
+        if out["missing_waypoints"]:
+            st.warning(f"⚠️ Unresolved waypoints: `{', '.join(out['missing_waypoints'])}`")
+
+        cls = out["classification"]
+
+        # ---- Assign Dep/Dest ITEMS based on toggle (sorted nearest-first) ----
+        if dep_is_last:
+            dep_items   = sorted(cls["beyond_last"],  key=lambda x: x["distance_km"])
+            dest_items  = sorted(cls["beyond_first"], key=lambda x: x["distance_km"])
+            dep_extra   = out["to_airports"]
+            dest_extra  = out["from_airports"]
         else:
-            dep = out_geo["classification"]["prefixes_first"]
-            dest = out_geo["classification"]["prefixes_last"]
-            first_wpt = out_geo.get("first_wpt", "?")
-            last_wpt  = out_geo.get("last_wpt", "?")
+            dep_items   = sorted(cls["beyond_first"], key=lambda x: x["distance_km"])
+            dest_items  = sorted(cls["beyond_last"],  key=lambda x: x["distance_km"])
+            dep_extra   = out["from_airports"]
+            dest_extra  = out["to_airports"]
 
-        if analysis["swap_sides"]:
-            dep, dest = dest, dep
 
-        dep_show  = to_wild(dep)  if analysis["collapse_wild"] else dep
-        dest_show = to_wild(dest) if analysis["collapse_wild"] else dest
+        dep_near  = dep_items[:N]
+        dest_near = dest_items[:N]
+
+        dep_pref_near  = ordered_prefixes(dep_near,  dep_extra)
+        dest_pref_near = ordered_prefixes(dest_near, dest_extra)
+        dep_pref_all   = ordered_prefixes(dep_items,  dep_extra)
+        dest_pref_all  = ordered_prefixes(dest_items, dest_extra)
+
 
         colA, colB = st.columns(2)
         with colA:
-            st.markdown(f"**Dep. Airports** ({len(dep_show)})")
-            st.code(", ".join(dep_show) or "—")
+            st.markdown(f"**Dep. Airports** — nearest {len(dep_pref_near)}")
+            st.code(", ".join(dep_pref_near) or "—")
         with colB:
-            st.markdown(f"**Dest. Airports** ({len(dest_show)})")
-            st.code(", ".join(dest_show) or "—")
+            st.markdown(f"**Dest. Airports** — nearest {len(dest_pref_near)}")
+            st.code(", ".join(dest_pref_near) or "—")
 
-        with st.expander("🔎 Raw FIR prefixes (before wildcard collapse)"):
-            e1, e2 = st.columns(2)
-            with e1:
-                st.markdown("**Dep**"); st.code(", ".join(dep) or "—")
-            with e2:
-                st.markdown("**Dest**"); st.code(", ".join(dest) or "—")
+        with st.expander(f"➕ Show ALL FIRs (Dep {len(dep_pref_all)} / Dest {len(dest_pref_all)})"):
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                st.markdown("**Dep. (all)**"); st.code(", ".join(dep_pref_all) or "—")
+            with cc2:
+                st.markdown("**Dest. (all)**"); st.code(", ".join(dest_pref_all) or "—")
 
         summary = (
             f"NOTAM: {analysis['notam_id']}\n"
-            f"Route: {rr.get('raw','')}\n"
-            f"First WPT: {first_wpt} | Last WPT: {last_wpt}\n"
-            f"Dep Airports: {', '.join(dep_show) or '-'}\n"
-            f"Dest Airports: {', '.join(dest_show) or '-'}\n"
-            f"Bidirectional: {rr['bidirectional']}"
+            f"Route: {out['route_string']}\n"
+            f"First WPT: {out['first_wpt']} | Last WPT: {out['last_wpt']}\n"
+            f"Dep Airports: {', '.join(dep_pref_near) or '-'}\n"
+            f"Dest Airports: {', '.join(dest_pref_near) or '-'}\n"
+            f"Bidirectional: {out['bidirectional']}"
         )
         st.markdown(f"**Copyable output (Reroute {i})**")
         st.code(summary, language="text")
 
-        # ----- Map -----
-        coords = [r["coord"] for r in out_geo.get("resolved", []) if r["coord"]]
+        # ---- Map ----
+        coords = [r["coord"] for r in out["resolved"] if r["coord"]]
         if coords:
             center = coords[len(coords)//2]
             m = folium.Map(location=center, zoom_start=4, tiles="cartodbpositron")
+
             folium.PolyLine(coords, color="black", weight=4).add_to(m)
-            folium.Marker(coords[0], icon=folium.Icon(color="green"),
-                          popup=f"FIRST: {first_wpt}").add_to(m)
+            folium.Marker(coords[0],  icon=folium.Icon(color="green"),
+                          popup=f"FIRST: {out['first_wpt']}").add_to(m)
             folium.Marker(coords[-1], icon=folium.Icon(color="red"),
-                          popup=f"LAST: {last_wpt}").add_to(m)
-            st.caption("🟢 START · 🔴 END · ⚫ reroute path")
-            st_folium(m, height=420, key=f"map_{i}", returned_objects=[])
+                          popup=f"LAST: {out['last_wpt']}").add_to(m)
+
+            for item in dep_near:
+                folium.CircleMarker(
+                    location=item["centroid"], radius=8,
+                    color="red", fill=True, fill_opacity=0.75,
+                    tooltip=f"{item['fir_code']} ({item['prefix']}) — DEP "
+                            f"{item['distance_km']:.0f}km",
+                ).add_to(m)
+
+            for item in dest_near:
+                folium.CircleMarker(
+                    location=item["centroid"], radius=8,
+                    color="blue", fill=True, fill_opacity=0.6,
+                    tooltip=f"{item['fir_code']} ({item['prefix']}) — DEST "
+                            f"{item['distance_km']:.0f}km",
+                ).add_to(m)
+
+            st.caption(
+                "🔴 Red circles = **Dep. Airports** side  |  "
+                "🔵 Blue circles = **Dest. Airports** side  |  "
+                "⚫ Black line = reroute path"
+            )
+
+            st_folium(m, height=500, key=f"map_{i}", returned_objects=[])

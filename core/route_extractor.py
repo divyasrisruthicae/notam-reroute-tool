@@ -1,6 +1,20 @@
 import re
+import difflib
 
 BIDIR_RE = re.compile(r"BIDIRECTIONAL", re.I)
+
+# raw lat/long fix: 3105N12452E / 310530N1245212E
+_COORD_RE = re.compile(r"^(\d{2})(\d{2})(\d{2})?([NS])(\d{3})(\d{2})(\d{2})?([EW])$")
+
+# "1. Y711 POINK - MUGUS"  /  "2) Y722 ATOTI - TESIM"
+_ITEM_HDR_RE = re.compile(
+    r"^\s*\d{1,2}\s*[\.\)]\s*([A-Z]{1,2}\d{1,4}[A-Z]?)\s+"
+    r"([A-Z0-9]{2,6})\s*[-\u2013\u2014]\s*([A-Z0-9]{2,6})\s*$"
+)
+
+# "ALTN RTE : PONIK DCT 3105N12452E DCT MUGUS"
+# Colon is REQUIRED, so "ALTN RTE ESTABLISHED DUE TO..." can never match.
+_ALTN_LINE_RE = re.compile(r"ALT[N]?\s*(?:RTE|ROUTE)\s*:\s*(.+)$", re.I)
 
 # Noise tokens that are NEVER waypoints
 _NOISE = {
@@ -31,6 +45,9 @@ def _is_waypoint(tok):
     t = re.sub(r"[^A-Z0-9]", "", tok.upper())
     if not t:
         return False
+    # raw lat/long fix IS a waypoint -- must be checked before the FL/digit rules
+    if _COORD_RE.match(t):
+        return True
     if t in _NOISE:
         return False
     # airway: single letter + digits (A412, G450, W41, N895, Q26, L524)
@@ -53,11 +70,21 @@ def _only_waypoints(tokens):
     return out
 
 
+def _reconcile(name, legs):
+    """Fix source typos: POINK (header) -> PONIK (as spelled in the ALTN RTE line)."""
+    if name in legs:
+        return name, False
+    cand = [l for l in legs if not _COORD_RE.match(l)]
+    close = difflib.get_close_matches(name, cand, n=1, cutoff=0.75)
+    return (close[0], True) if close else (name, False)
+
+
 def extract_reroutes(e_text):
     """
     Returns list of reroute dicts. ONLY real reroutes are returned
     (Damascus 'AVBL FOR .. OVF' lines, 'ALTN RTE' lines, numbered China
-    routes, VOR-adjust lines, and standalone dash routes).
+    routes, numbered Korea 'ALTN RTE :' routes, VOR-adjust lines, and
+    standalone dash routes).
     FL ranges and closure-only lines (no ALTN RTE) are ignored.
     """
     results = []
@@ -88,7 +115,7 @@ def extract_reroutes(e_text):
 
     # ---------- Style B: ALTN RTE (anchor on ALTN RTE, look BACK for closure) ----------
     for m in re.finditer(
-        r"ALTN\s+RTE:\s*([A-Z0-9\-\s\.']+?)(?=\.\s|\(|$)",
+        r"ALTN\s+RTE\s*:\s*([A-Z0-9\-\s\.']+?)(?=\.\s|\(|$)",
         joined, re.I,
     ):
         alt = m.group(1)
@@ -123,6 +150,35 @@ def extract_reroutes(e_text):
             "from_airports": [],
             "to_airports": [],
         })
+
+    # ---------- Style F: numbered airway header + "ALTN RTE :" line ----------
+    # 1. Y711 POINK - MUGUS
+    #    ALTN RTE : PONIK DCT 3105N12452E DCT MUGUS
+    pending = None
+    for line in lines:
+        h = _ITEM_HDR_RE.match(line.upper())
+        if h:
+            pending = {"airway": h.group(1), "from": h.group(2), "to": h.group(3)}
+            continue
+        am = _ALTN_LINE_RE.search(line)
+        if am and pending:
+            legs = _only_waypoints(_tokenize(am.group(1)))
+            if len(legs) >= 2:
+                a, t1 = _reconcile(pending["from"], legs)
+                b, t2 = _reconcile(pending["to"], legs)
+                results.append({
+                    "raw": _clean(line),
+                    "tokens": legs,
+                    "waypoints": legs,
+                    "bidirectional": False,
+                    "direction_hint": None,
+                    "closed_airway": pending["airway"],
+                    "closed_segment": (a, b),
+                    "from_airports": [],
+                    "to_airports": [],
+                    "typo_corrected": t1 or t2,
+                })
+            pending = None
 
     # ---------- Style C: numbered China "N. X TO Y: route" ----------
     for m in re.finditer(
@@ -199,6 +255,7 @@ def extract_reroutes(e_text):
     for r in results:
         r.setdefault("from_airports", [])
         r.setdefault("to_airports", [])
+        r.setdefault("typo_corrected", False)
 
     # ---------- Drop Style-D duplicates ----------
     # Signatures (waypoints+bidir) that already have a real closed airway
