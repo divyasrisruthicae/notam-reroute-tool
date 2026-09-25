@@ -83,8 +83,11 @@ if st.button("🚀 Analyze"):
     reroutes = extract_reroutes(e_text)
     q_coord  = extract_q_coordinate(notam_text)
 
-    outputs = []
+    outputs, optimizer_only = [], []
     for rr in reroutes:
+        if not rr["cr"]:
+            optimizer_only.append(rr)
+            continue
         out = build_dep_dest(
             rr, wp_res, fir_res, pfx_res,
             source_fir=src_fir,
@@ -99,6 +102,7 @@ if st.button("🚀 Analyze"):
         "notam_id": notam_id,
         "src_fir": src_fir,
         "reroutes": outputs,
+        "optimizer_only": optimizer_only,
         "dep_side_choice": dep_side_choice,
         "nearest_n": nearest_n,
     }
@@ -106,13 +110,15 @@ if st.button("🚀 Analyze"):
 # ---------- Render ----------
 analysis = st.session_state.analysis
 if analysis:
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("NOTAM ID", analysis["notam_id"] or "—")
     c2.metric("Source FIR", analysis["src_fir"] or "—")
-    c3.metric("Reroutes found", len(analysis["reroutes"]))
+    c3.metric("Coded routes", len(analysis["reroutes"]))
+    c4.metric("Optimizer-resolved", len(analysis.get("optimizer_only", [])))
 
-    if not analysis["reroutes"]:
+    if not analysis["reroutes"] and not analysis.get("optimizer_only"):
         st.warning("No reroutes extracted from this NOTAM text.")
+
 
     dep_is_last = analysis["dep_side_choice"].startswith("Route END")
     N = analysis["nearest_n"]
@@ -124,8 +130,9 @@ if analysis:
         if rr["closed_airway"]:
             seg = rr["closed_segment"]
             if seg:
+                tag = " _(inferred from CR endpoints)_" if rr["segment_inferred"] else ""
                 st.info(f"Closed: **{rr['closed_airway']}** between "
-                        f"**{seg[0]}** and **{seg[1]}**")
+                        f"**{seg[0]}** and **{seg[1]}**{tag}")
             else:
                 st.info(f"Closed: **{rr['closed_airway']}**")
 
@@ -220,3 +227,18 @@ if analysis:
             )
 
             st_folium(m, height=500, key=f"map_{i}", returned_objects=[])
+
+            # Show optimizer-resolved reroutes
+    opt = analysis.get("optimizer_only", [])
+    if opt:
+        st.markdown("---")
+        st.subheader(f"⚙️ Optimizer-resolved — no CR issued ({len(opt)})")
+        st.caption(
+            "These reroutes connect waypoints by airway, so the NOTAM never "
+            "states the intermediate fixes. Issuing a coded route here would "
+            "force one specific path and over-constrain the flight plan, so "
+            "the optimizer selects the routing instead."
+            )
+        for rr in opt:
+            awy = rr["closed_airway"] or "—"
+            st.markdown(f"**{awy}** — `{rr['raw']}`")
