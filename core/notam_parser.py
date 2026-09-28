@@ -10,6 +10,12 @@ def extract_source_fir(text):
     m = re.search(r"Q\)\s*([A-Z]{4})", text)
     return m.group(1) if m else None
 
+def extract_a_location(text):
+    # NEW. First 4-letter code after "A)"
+    # e.g. "A)OEJN B)2609..." -> "OEJN"
+    # Used as the departure airport for "DEP TFC TO XXXX" NOTAMs.
+    m = re.search(r"\bA\)\s*([A-Z]{4})\b", text)
+    return m.group(1) if m else None
 
 def extract_q_coordinate(text):
     """

@@ -3,13 +3,13 @@ import folium
 from streamlit_folium import st_folium
 
 from core.notam_parser import (
-    extract_notam_id, extract_source_fir, extract_e_section, extract_q_coordinate
+    extract_notam_id, extract_source_fir, extract_e_section, extract_q_coordinate, extract_a_location,      # NEW: A) airport, used for "DEP TFC TO XXXX" NOTAMs
 )
 from core.route_extractor import extract_reroutes
 from core.waypoint_resolver import WaypointResolver
 from core.fir_resolver import FIRResolver
 from core.prefix_resolver import PrefixResolver
-from core.dep_dest_builder import build_dep_dest
+from core.dep_dest_builder import build_dep_dest, star_prefixes   # CHANGED: + star_prefixes
 
 st.set_page_config(page_title="NOTAM Reroute Tool", layout="wide")
 st.title("✈️ NOTAM Reroute → Dep/Dest FIR Tool")
@@ -30,10 +30,21 @@ def ordered_prefixes(items, extra_airports):
     for it in items:
         if it["prefix"] and it["prefix"] not in seen:
             seen.append(it["prefix"])
+    # CHANGED: country prefixes get a * (ZH -> ZH*). Airports are added after,
+    # so 4-letter codes like ZGGG never get a star.
+    seen = star_prefixes(seen)
     for a in extra_airports:
         if a and a not in seen:
             seen.append(a)
     return seen
+
+# NEW: short text like "DEP OEJN → ARR OEDF" for aerodrome NOTAMs
+def ad_flow_label(rr):
+    if not rr.get("ad_flow"):
+        return ""
+    dep = ", ".join(rr["from_airports"]) or "—"
+    arr = ", ".join(rr["to_airports"]) or "—"
+    return f"DEP {dep} → ARR {arr}"
 
 # ---------- Sidebar ----------
 with st.sidebar:
@@ -48,6 +59,13 @@ with st.sidebar:
              "departure airports. The other end becomes destinations.",
     )
 
+    # NEW: analyst can hide / show the optimizer-resolved reroutes
+    show_optimizer = st.toggle(
+        "Show optimizer-resolved reroutes", value=True,
+        help="Airway-only reroutes (wpt - AWY - wpt). The NOTAM doesn't list "
+             "every fix, so check these before using them.",
+    )
+
     nearest_n = st.slider(
         "Show nearest FIRs per side", 3, 40, 6, 1,
         help="Shows only the N closest FIRs first. Expand below to see all.",
@@ -60,7 +78,8 @@ with st.sidebar:
     min_dist = st.slider("Min ray distance (km)", 0, 1000, 0, 50)
     corridor = st.slider(
         "Search slice half-angle (°)", 15, 90, 45, 5,
-        help="±45° around the reference line (closed segment extended outward)."
+        # CHANGED: slices now come off the CR's end legs, not the closed segment
+        help="±45° around the reference line (CR end leg extended outward)."
     )
 
     st.caption("Source FIR is auto-excluded. Nearest countries shown first.")
@@ -82,12 +101,17 @@ if st.button("🚀 Analyze"):
     e_text   = extract_e_section(notam_text)
     reroutes = extract_reroutes(e_text)
     q_coord  = extract_q_coordinate(notam_text)
+    a_loc    = extract_a_location(notam_text)      # NEW
 
-    outputs, optimizer_only = [], []
+    # NEW: "DEP TFC TO OEDF" -> departure airport = the A) airport (e.g. OEJN)
     for rr in reroutes:
-        if not rr["cr"]:
-            optimizer_only.append(rr)
-            continue
+        if rr.get("ad_flow") == "DEP" and not rr["from_airports"] and a_loc:
+            rr["from_airports"] = [a_loc]
+
+    # CHANGED: removed the "if not rr['cr']: skip" filter.
+    # EVERY reroute (CR and optimizer-resolved) now gets Dep/Dest.
+    outputs = []
+    for rr in reroutes:
         out = build_dep_dest(
             rr, wp_res, fir_res, pfx_res,
             source_fir=src_fir,
@@ -102,7 +126,7 @@ if st.button("🚀 Analyze"):
         "notam_id": notam_id,
         "src_fir": src_fir,
         "reroutes": outputs,
-        "optimizer_only": optimizer_only,
+        # REMOVED: "optimizer_only" list - they're inside "reroutes" now
         "dep_side_choice": dep_side_choice,
         "nearest_n": nearest_n,
     }
@@ -110,22 +134,50 @@ if st.button("🚀 Analyze"):
 # ---------- Render ----------
 analysis = st.session_state.analysis
 if analysis:
+    # NEW: count CR vs optimizer from the one list
+    all_rr = analysis["reroutes"]
+    n_cr  = sum(1 for rr, _ in all_rr if rr["cr"])
+    n_opt = len(all_rr) - n_cr
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("NOTAM ID", analysis["notam_id"] or "—")
     c2.metric("Source FIR", analysis["src_fir"] or "—")
-    c3.metric("Coded routes", len(analysis["reroutes"]))
-    c4.metric("Optimizer-resolved", len(analysis.get("optimizer_only", [])))
+    c3.metric("Coded routes", n_cr)
+    c4.metric("Optimizer-resolved", n_opt)
 
-    if not analysis["reroutes"] and not analysis.get("optimizer_only"):
+    if not all_rr:
         st.warning("No reroutes extracted from this NOTAM text.")
 
+    # NEW: apply the sidebar toggle (works straight away, no re-Analyze needed)
+    shown = [(rr, out) for rr, out in all_rr if rr["cr"] or show_optimizer]
+    if n_opt and not show_optimizer:
+        st.caption(f"🙈 {n_opt} optimizer-resolved reroute(s) hidden — "
+                   f"turn on the toggle in the sidebar to see them.")
 
-    dep_is_last = analysis["dep_side_choice"].startswith("Route END")
+    dep_is_last_setting = analysis["dep_side_choice"].startswith("Route END")   # CHANGED: renamed
     N = analysis["nearest_n"]
 
-    for i, (rr, out) in enumerate(analysis["reroutes"], 1):
+    for i, (rr, out) in enumerate(shown, 1):
         st.markdown(f"---\n### 🛫 Reroute {i}")
+
+        # NEW: mark so the analyst can see which kind it is
+        if rr["cr"]:
+            st.success("📌 **Coded route (CR)** — full path given in the NOTAM "
+                       "(DCT / coordinate fix).")
+        else:
+            st.warning("⚙️ **Optimizer-resolved** — airway route (wpt - AWY - wpt), "
+                       "fixes in between not listed. Analyst to check before use.")
+
         st.code(rr["raw"])
+
+        # NEW: aerodrome NOTAM -> traffic always flies FIRST -> LAST
+        # (e.g. TOKRA ... BOSUT -> OEJN), so Dep = START side whatever the
+        # sidebar says. Normal NOTAMs still use the sidebar setting.
+        if rr.get("ad_flow"):
+            dep_is_last = False
+            st.info(f"Aerodrome routing: **{ad_flow_label(rr)}**")
+        else:
+            dep_is_last = dep_is_last_setting
 
         if rr["closed_airway"]:
             seg = rr["closed_segment"]
@@ -183,6 +235,7 @@ if analysis:
 
         summary = (
             f"NOTAM: {analysis['notam_id']}\n"
+            f"Type: {'CR' if rr['cr'] else 'Optimizer-resolved'}\n"   # NEW line
             f"Route: {out['route_string']}\n"
             f"First WPT: {out['first_wpt']} | Last WPT: {out['last_wpt']}\n"
             f"Dep Airports: {', '.join(dep_pref_near) or '-'}\n"
@@ -216,13 +269,13 @@ if analysis:
                 attr="Tiles © Esri", name="Satellite", max_zoom=16,
             ).add_to(m)
 
+            # CHANGED: optimizer-resolved reroutes are drawn dashed
             folium.PolyLine(coords, color="black", weight=4,
-                            tooltip="CR / reroute").add_to(m)
+                            dash_array=None if rr["cr"] else "10",
+                            tooltip="CR" if rr["cr"] else "Optimizer-resolved").add_to(m)
 
-            ref = [c for _, c in out.get("reference_path", [])]
-            if ref:
-                folium.PolyLine(ref, color="#1e90ff", weight=5, dash_array="8",
-                                tooltip=f"Closed segment ({out['reference_source']})").add_to(m)
+            # REMOVED: blue dashed "closed segment" line - the slices now
+            # come off the black reroute line's end legs, so it's not needed.
 
             dep_slice  = cls["slice_last"]  if dep_is_last else cls["slice_first"]
             dest_slice = cls["slice_first"] if dep_is_last else cls["slice_last"]
@@ -243,7 +296,7 @@ if analysis:
                 folium.CircleMarker(
                     location=item["centroid"], radius=8,
                     color="red", fill=True, fill_opacity=0.75,
-                    tooltip=f"{item['fir_code']} ({item['prefix']}) — DEP "
+                    tooltip=f"{item['fir_code']} ({item['prefix']}*) — DEP "     # CHANGED: *
                             f"{item['distance_km']:.0f}km",
                 ).add_to(m)
 
@@ -251,29 +304,17 @@ if analysis:
                 folium.CircleMarker(
                     location=item["centroid"], radius=8,
                     color="blue", fill=True, fill_opacity=0.6,
-                    tooltip=f"{item['fir_code']} ({item['prefix']}) — DEST "
+                    tooltip=f"{item['fir_code']} ({item['prefix']}*) — DEST "    # CHANGED: *
                             f"{item['distance_km']:.0f}km",
                 ).add_to(m)
 
             st.caption(
                 "🔴 Red circles = **Dep. Airports** side  |  "
                 "🔵 Blue circles = **Dest. Airports** side  |  "
-                "⚫ Black line = reroute path"
+                "⚫ Black line = reroute path (dashed = optimizer-resolved)"
             )
             folium.LayerControl(collapsed=True).add_to(m)
             st_folium(m, height=500, key=f"map_{i}", returned_objects=[])
 
-            # Show optimizer-resolved reroutes
-    opt = analysis.get("optimizer_only", [])
-    if opt:
-        st.markdown("---")
-        st.subheader(f"⚙️ Optimizer-resolved — no CR issued ({len(opt)})")
-        st.caption(
-            "These reroutes connect waypoints by airway, so the NOTAM never "
-            "states the intermediate fixes. Issuing a coded route here would "
-            "force one specific path and over-constrain the flight plan, so "
-            "the optimizer selects the routing instead."
-            )
-        for rr in opt:
-            awy = rr["closed_airway"] or "—"
-            st.markdown(f"**{awy}** — `{rr['raw']}`")
+    # REMOVED: the separate "Optimizer-resolved — no CR issued" list at the
+    # bottom. Those reroutes now show above with full Dep/Dest + a ⚙️ mark.

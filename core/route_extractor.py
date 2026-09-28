@@ -8,9 +8,11 @@ NOTAMs are written in many different styles, so we have one small
 
 Key idea - CR (coded route):
   cr = True   -> the NOTAM gives a FIXED path (coordinate fix or DCT chain)
-                 -> we plot it and work out Dep/Dest
+                 -> shown as "Coded route (CR)"
   cr = False  -> it's just "wpt - AIRWAY - wpt", the NOTAM doesn't list the
-                 fixes in between -> we leave it to the optimizer
+                 fixes in between -> shown as "Optimizer-resolved"
+  CHANGED: "cr" is now only a LABEL. Both kinds get Dep/Dest airports,
+  the analyst decides which ones to keep.
 """
 
 import re
@@ -41,7 +43,7 @@ _NAVAID_RE = re.compile(
     r"\b[A-Z]+\s+(?:DVOR/DME|VOR/DME|DVOR|VOR|NDB)\s*['\"]([A-Z0-9]{2,5})['\"]"
 )
 
-# NEW: navaid type written AFTER the ID with no quotes:
+# Navaid type written AFTER the ID with no quotes:
 #   "IKA DVOR/DME"  -> "IKA"      "HAM VOR" -> "HAM"
 _NAVAID_SUFFIX_RE = re.compile(
     r"\b([A-Z]{2,3})\s+(?:DVOR/DME|VOR/DME|DVOR|VOR|NDB)\b(?!\s*['\"])"
@@ -51,7 +53,7 @@ _NAVAID_SUFFIX_RE = re.compile(
 #   "... TO BEYOND ABTUD"  /  "... FOR BEYOND LBN"  /  "... FOR ARR ZGGG"
 _ROUTE_TAIL_RE = re.compile(r"\b(?:FOR|TO)\s+(?:BEYOND|ARR|DEP)\b.*$")
 
-# NEW: closure sentence, e.g.
+# Closure sentence, e.g.
 #   "AWY G208/L125 BTN RADAL AND IKA CLSD"
 #   "AIRWAY N39 BTN DEMBA AND OBRIX CLSD"
 #   "ATS ROUTE A1 SEGMENT BTN X AND Y"
@@ -63,9 +65,10 @@ _CLOSURE_RE = re.compile(
     r"(?:SEGMENT\s+)?BTN\s+([A-Z0-9]{2,15})\s+AND\s+([A-Z0-9]{2,15})"
 )
 
-# NEW: a DCT chain anywhere in the text:
+# A route chain anywhere in the text:
 #   "ROVAD DCT IKA"
 #   "ULDUS DCT ALKUP DCT IMLIM DCT OXADU M715 OBRIX"
+#   "EGREP B417 PATOR B417 BDB"   (airway-only - now caught too)
 # = waypoint, then one or more (DCT or AIRWAY) + waypoint
 _CHAIN_WP = r"[A-Z0-9]{2,15}"
 _CHAIN_LINK = r"(?:DCT|[A-Z]{1,2}\d{1,4}[A-Z]?)"
@@ -73,8 +76,20 @@ _CHAIN_RE = re.compile(
     rf"(?<![A-Z0-9])({_CHAIN_WP}(?:\s+{_CHAIN_LINK}\s+{_CHAIN_WP})+)(?![A-Z0-9])"
 )
 
-# NEW: direction words in front of a route ("FOR WESTBOUND:", "EB")
+# Direction words in front of a route ("FOR WESTBOUND:", "EB")
 _DIR_WORD_RE = re.compile(r"\b(WEST|EAST|NORTH|SOUTH)BOUND\b|\b(WB|EB|NB|SB)\b")
+
+# NEW: aerodrome traffic sentences (Saudi style)
+#   "INBD TFC TO OEJN AD ..."   -> traffic ARRIVING at OEJN
+#   "DEP TFC TO OEDF AD ..."    -> traffic DEPARTING (from the A) airport) to OEDF
+_AD_ARR_RE = re.compile(
+    r"\b(?:INBD|INBOUND|ARRIVING|ARR)\s+(?:TFC|TRAFFIC|ACFT|FLT|FLIGHTS?)\s+"
+    r"(?:TO|FOR|INTO)\s+([A-Z]{4})\b"
+)
+_AD_DEP_RE = re.compile(
+    r"\b(?:DEP|DEPARTING|OUTBD|OUTBOUND)\s+(?:TFC|TRAFFIC|ACFT|FLT|FLIGHTS?)\s+"
+    r"(?:TO|FOR)\s+([A-Z]{4})\b"
+)
 
 # Airway name: 1-2 letters + 1-4 digits + optional letter (L642, UL888, W15)
 _AWY_TOK_RE = re.compile(r"^[A-Z]{1,2}\d{1,4}[A-Z]?$")
@@ -114,8 +129,10 @@ _NOISE = {
     "MENTIONED", "SEGMENTS", "BELOW", "SHALL", "ACT",
     # word that can sit in front of a route
     "ROUTE",
-    # NEW: Iran-style words that can end up next to a DCT chain
+    # Iran-style words that can end up next to a DCT chain
     "FPL", "FILE", "TOS", "MNM", "LVL", "FLT", "DVOR", "DME", "AWY", "AIRWAY",
+        # NEW: Saudi-style aerodrome words
+    "INBD", "OUTBD", "AD", "TRAFFIC",
 }
 
 
@@ -142,7 +159,7 @@ def _normalize_coords(text):
 
 def _find_closures(text):
     """
-    NEW. Finds every "AWY X BTN A AND B" closure sentence in the text.
+    Finds every "AWY X BTN A AND B" closure sentence in the text.
     Returns a list of (airway, (A, B)).
       "AWY G208/L125 BTN RADAL AND IKA CLSD" -> ("G208/L125", ("RADAL", "IKA"))
     Navaid words (DVOR/DME...) must already be removed from the text.
@@ -156,7 +173,7 @@ def _find_closures(text):
 
 def _pick_closure(closures, waypoints):
     """
-    NEW. Which closure belongs to this route?
+    Which closure belongs to this route?
       1. one whose end fix (A or B) is IN the route  -> that one
       2. otherwise, if the NOTAM has only ONE closure -> that one
       3. otherwise we don't guess                     -> (None, None)
@@ -169,6 +186,20 @@ def _pick_closure(closures, waypoints):
         return closures[0]
     return None, None
 
+def _find_ad_flow(text):
+    """
+    NEW. Is this NOTAM about traffic to/from ONE aerodrome?
+      "INBD TFC TO OEJN AD" -> ("ARR", "OEJN")
+      "DEP TFC TO OEDF AD"  -> ("DEP", "OEDF")
+      nothing found         -> (None, None)
+    """
+    m = _AD_ARR_RE.search(text)
+    if m:
+        return "ARR", m.group(1)
+    m = _AD_DEP_RE.search(text)
+    if m:
+        return "DEP", m.group(1)
+    return None, None
 
 def _clean(s):
     # Squash extra spaces and trim dots/commas off the ends
@@ -255,8 +286,8 @@ def _is_cr(waypoints, raw):
     Is this a CR (forced path)? Only if the NOTAM spells out the full path:
       - it has a coordinate fix   (122030N1083917E), or
       - it has a DCT chain        (LKH DCT ... DCT KARAN)
-    'wpt - AIRWAY - wpt' (N892 - MIMUX - N500) is NOT a CR: the fixes in
-    between are never given, so the optimizer picks the path.
+    'wpt - AIRWAY - wpt' (N892 - MIMUX - N500) is NOT a CR -> "optimizer-resolved".
+    CHANGED: this is only a label now - every reroute still gets Dep/Dest.
     """
     if any(_COORD_RE.match(w) for w in waypoints):
         return True
@@ -275,6 +306,8 @@ def _infer_segment(legs, airports=()):
     Coordinate fixes are the detour itself, so they can't be the ends.
     Airports (VVTS/VVTH) are also skipped - they're the city pair,
     not the closed airway segment.
+    (Only used for the "Closed:" info box - the search slices come
+     from the CR itself, see dep_dest_builder.py.)
     """
     skip = {a.upper() for a in airports}
     named = [l for l in legs if not _COORD_RE.match(l) and l.upper() not in skip]
@@ -302,11 +335,11 @@ def extract_reroutes(e_text):
     Styles: A Damascus OVF | B ALTN RTE: | C numbered 'X TO Y:' |
             D standalone dash | E VOR adjust | F numbered + ALTN RTE |
             G '+' bullet route | H 'VIA ... : CHANGE TO ...' |
-            I DCT chain anywhere (Iran style)  <- NEW
+            I route chain anywhere (Iran style)
 
     Each dict has:
-      "cr"               -> True = forced route, plot it
-                            False = leave to the optimizer
+      "cr"               -> True = coded route, False = optimizer-resolved
+                            (label only - both get Dep/Dest)
       "closed_segment"   -> (from, to) of the closed airway part
       "segment_inferred" -> True if we guessed the segment from the CR ends
                             (NOTAM didn't say it directly)
@@ -491,21 +524,23 @@ def extract_reroutes(e_text):
                     "cr": _is_cr(wps, line),
                 })
 
-    # ---------- NEW Style I: DCT chain anywhere (Iran style) ----------
+    # ---------- Style I: route chain anywhere (Iran style) ----------
     #   "... SHALL FILE FPL VIA ROVAD DCT IKA DVOR/DME,"
     #   "- ALTN TOS FOR WESTBOUND: RADAL DCT IMKER DCT ULDUS,"
+    #   "... VIA EGREP B417 PATOR B417 BDB ..."   (airway-only - now caught too)
     # Runs LAST, and only adds routes the other styles didn't already catch,
     # so it can never change what Styles A-H give.
     txt_i = _NAVAID_SUFFIX_RE.sub(r"\1", joined)         # "IKA DVOR/DME" -> "IKA"
     closures = _find_closures(txt_i)                     # "AWY X BTN A AND B" sentences
+    ad_flow, ad_apt = _find_ad_flow(txt_i)               # NEW: "INBD TFC TO OEJN" etc.
     already = {tuple(r["waypoints"]) for r in results}   # routes other styles found
     prev_end = 0
     for m in _CHAIN_RE.finditer(txt_i):
         chain = m.group(1)
 
-        # Must contain a DCT - "A M715 B" alone is not a CR
-        if not re.search(r"\bDCT\b", chain):
-            continue
+        # CHANGED: removed the "must contain a DCT" check.
+        # "wpt AWY wpt" chains are caught too now - _is_cr below
+        # labels them "optimizer-resolved" so the analyst can decide.
 
         wps = _only_waypoints(_tokenize(chain))
         if len(wps) < 2 or tuple(wps) in already:
@@ -531,8 +566,13 @@ def extract_reroutes(e_text):
             "raw": _clean(chain), "tokens": wps, "waypoints": wps,
             "bidirectional": bidir, "direction_hint": hint,
             "closed_airway": awy, "closed_segment": seg,
-            "from_airports": [], "to_airports": [],
-            "cr": True,
+            # NEW: aerodrome NOTAM -> the named airport is the destination.
+            # (For DEP, the departure airport = A) line - app.py fills it in.)
+            "from_airports": [], "to_airports": [ad_apt] if ad_apt else [],
+            "ad_flow": ad_flow,
+            # CHANGED: was always True. Now DCT chain = CR,
+            # airway-only chain = optimizer-resolved.
+            "cr": _is_cr(wps, chain),
         })
         already.add(tuple(wps))
         prev_end = m.end()
@@ -545,6 +585,7 @@ def extract_reroutes(e_text):
         r.setdefault("new_airways", [])
         r.setdefault("cr", False)
         r.setdefault("closed_segment", None)
+        r.setdefault("ad_flow", None)        # NEW
 
     # ---------- UNIVERSAL: closed segment from the CR itself ----------
     # For every style: if it's a CR and no segment was given,

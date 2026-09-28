@@ -3,78 +3,24 @@ dep_dest_builder.py
 -------------------
 Takes ONE reroute (from route_extractor) and works out:
   - coordinates + country for every waypoint
-  - the closed segment we hang the search slices on
   - which countries are on the Dep side and the Dest side
+
+CHANGED: the 45 deg search slices now hang off the CR ITSELF:
+  at FIRST : direction  CR wpt2   -> CR wpt1   (and beyond)
+  at LAST  : direction  CR wptN-1 -> CR wptN   (and beyond)
+The closed airway segment is no longer used for the slices,
+so _reference_path() and _km() were removed.
 """
 from .side_classifier import classify_firs_directional
-from .waypoint_resolver import _haversine_km
 
 
-def _km(p, q):
-    # Distance in km between two (lat, lon) points
-    return _haversine_km(p[0], p[1], q[0], q[1])
-
-
-def _reference_path(reroute, wp_res, with_coord):
+def star_prefixes(codes):
     """
-    Picks the line the search slices hang off. We want the CLOSED SEGMENT,
-    not the detour. Tries in this order:
-      1. closed airway + segment known -> real airway fixes a..b (waypoints.csv)
-      2. only the segment known        -> straight line a -> b
-      3. nothing known                 -> just use the CR itself
-    Always kept in the same direction as the CR (FIRST -> LAST).
-    Returns (names, coords, source).
+    NEW. Adds a * to every 2-letter country prefix:
+        ["ZH", "ZS", "RJ", "ZGGG"] -> ["ZH*", "ZS*", "RJ*", "ZGGG"]
+    4-letter airports (ZGGG) are left as they are.
     """
-    # Names and coords of the CR waypoints we could find
-    cr_names = [r["waypoint"] for r in with_coord]
-    cr_coords = [r["coord"] for r in with_coord]
-
-    # No closed segment -> fall back to the CR (option 3)
-    seg = reroute.get("closed_segment")
-    if not seg or not seg[0] or not seg[1]:
-        return cr_names, cr_coords, "cr"
-
-    a, b = seg[0].upper(), seg[1].upper()
-
-    # Coordinates of a and b (from the CR if they're in it, otherwise
-    # look them up, picking the one nearest the CR)
-    lookup = dict(zip(cr_names, cr_coords))
-    ca = lookup.get(a) or wp_res.coord(a, ref_coord=cr_coords[0])
-    cb = lookup.get(b) or wp_res.coord(b, ref_coord=cr_coords[-1])
-
-    # ---- Make sure a -> b points the same way as the CR ----
-    if a in cr_names and b in cr_names:
-        # Both in the CR -> use their order in the CR
-        if cr_names.index(a) > cr_names.index(b):
-            a, b, ca, cb = b, a, cb, ca
-    elif a == cr_names[-1] or b == cr_names[0]:
-        # One end matches the wrong end of the CR -> swap
-        a, b, ca, cb = b, a, cb, ca
-    elif a not in cr_names and b not in cr_names and ca and cb:
-        # CHANGED: neither end is in the CR (e.g. Iran N39 DEMBA-OBRIX,
-        # CR RADAL..ULDUS). Before, we never swapped here, so Dep/Dest
-        # could come out flipped. Now: a must be the end CLOSER to the
-        # CR's first point.
-        keep = _km(ca, cr_coords[0]) + _km(cb, cr_coords[-1])
-        swap = _km(cb, cr_coords[0]) + _km(ca, cr_coords[-1])
-        if swap < keep:
-            a, b, ca, cb = b, a, cb, ca
-
-    # Option 1: follow the real airway fixes between a and b
-    # CHANGED: "G208/L125" = 2 airways on the same segment -> try each one
-    awy = reroute.get("closed_airway")
-    if awy:
-        for one_awy in str(awy).split("/"):
-            path = wp_res.airway_path(one_awy.strip(), a, b)
-            if path and len(path[0]) >= 2:
-                return path[0], path[1], "airway"
-
-    # Option 2: straight line a -> b
-    if ca and cb and ca != cb:
-        return [a, b], [ca, cb], "segment"
-
-    # Couldn't build the segment -> option 3
-    return cr_names, cr_coords, "cr"
+    return [c + "*" if c and len(c) == 2 else c for c in codes]
 
 
 def build_dep_dest(reroute, wp_res, fir_res, pfx_res,
@@ -87,6 +33,7 @@ def build_dep_dest(reroute, wp_res, fir_res, pfx_res,
     anchor_coord : (lat, lon) from the NOTAM Q-line. Helps pick the right
                    waypoint when the same name is in 2 countries
                    (e.g. BBS Algeria vs India).
+    Works the same for CR and optimizer-resolved reroutes.
     """
     wps = reroute["waypoints"]
 
@@ -136,8 +83,11 @@ def build_dep_dest(reroute, wp_res, fir_res, pfx_res,
                 "resolved": resolved,
                 "records": []}
 
-    # Step 3: pick the line the slices hang off (closed segment)
-    ref_names, ref_coords, ref_source = _reference_path(reroute, wp_res, with_coord)
+    # Step 3 (CHANGED): slices hang off the CR's own end legs.
+    # We pass the CR's points in order - side_classifier uses
+    # the first 2 and the last 2 of them for the reference lines.
+    ref_names = [r["waypoint"] for r in with_coord]
+    ref_coords = [r["coord"] for r in with_coord]
 
     # Step 4: don't list the NOTAM's own country on either side
     exclude_prefix = None
@@ -152,14 +102,31 @@ def build_dep_dest(reroute, wp_res, fir_res, pfx_res,
         corridor_deg=corridor_deg,
         exclude_prefix=exclude_prefix,
     )
+    # NEW: aerodrome NOTAMs - the airport end is KNOWN, so no slice search there.
+    #   ARR ("INBD TFC TO OEJN") -> LAST end = the airport only
+    #   DEP ("DEP TFC TO OEDF")  -> both ends are airports (A) airport -> OEDF)
+    # We empty that side's slice results so only the airport shows.
+    ad_flow = reroute.get("ad_flow")
+
+    def _blank(side):
+        classification[f"beyond_{side}"] = []
+        classification[f"prefixes_{side}"] = []
+        classification[f"slice_{side}"] = []
+
+    if ad_flow == "ARR":
+        _blank("last")
+    elif ad_flow == "DEP":
+        _blank("first")
+        _blank("last")
 
     # Airports named in the NOTAM text (e.g. Style C "ZGGG TO ZBAA")
     from_airports = reroute.get("from_airports", [])
     to_airports   = reroute.get("to_airports", [])
 
     # Countries + airports for each side
-    beyond_first_out = list(classification["prefixes_first"]) + from_airports
-    beyond_last_out  = list(classification["prefixes_last"])  + to_airports
+    # CHANGED: country prefixes get a * (ZH -> ZH*)
+    beyond_first_out = star_prefixes(classification["prefixes_first"]) + from_airports
+    beyond_last_out  = star_prefixes(classification["prefixes_last"])  + to_airports
 
     # Step 6: build output records
     #   bidirectional -> one record each way
@@ -183,10 +150,9 @@ def build_dep_dest(reroute, wp_res, fir_res, pfx_res,
         "resolved": resolved,
         "missing_waypoints": missing,
         "ambiguous_waypoints": ambiguous,
-        "first_wpt": ref_names[0],                          # start of closed segment
-        "last_wpt":  ref_names[-1],                         # end of closed segment
-        "reference_path": list(zip(ref_names, ref_coords)), # blue dashed line on map
-        "reference_source": ref_source,                     # "airway" / "segment" / "cr"
+        "first_wpt": ref_names[0],                          # CHANGED: first CR waypoint
+        "last_wpt":  ref_names[-1],                         # CHANGED: last CR waypoint
+        # REMOVED: "reference_path" / "reference_source" (closed-segment line)
         "classification": classification,
         "from_airports": from_airports,
         "to_airports": to_airports,
@@ -196,4 +162,6 @@ def build_dep_dest(reroute, wp_res, fir_res, pfx_res,
         "closed_segment": reroute["closed_segment"],
         "source_fir": source_fir,
         "excluded_prefix": exclude_prefix,
+        "cr": reroute.get("cr", False),                     # NEW: CR or optimizer label
+        "ad_flow": ad_flow,                                 # NEW: "ARR" / "DEP" / None
     }
