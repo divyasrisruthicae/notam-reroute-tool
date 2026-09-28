@@ -4,7 +4,7 @@ route_extractor.py
 Reads the NOTAM E) text and pulls out every reroute in it.
 
 NOTAMs are written in many different styles, so we have one small
-"catcher" per style (A to H). Each catcher returns the same kind of dict.
+"catcher" per style (A to I). Each catcher returns the same kind of dict.
 
 Key idea - CR (coded route):
   cr = True   -> the NOTAM gives a FIXED path (coordinate fix or DCT chain)
@@ -22,28 +22,59 @@ BIDIR_RE = re.compile(r"BIDIRECTIONAL", re.I)
 # Raw lat/long fix: 3105N12452E or 122030N1083917E
 _COORD_RE = re.compile(r"^(\d{2})(\d{2})(\d{2})?([NS])(\d{3})(\d{2})(\d{2})?([EW])$")
 
-# NEW: coordinate written with the letter FIRST (China style):
+# Coordinate written with the letter FIRST (China style):
 #   N253957E1095707   or   N275120 E1105724   (space in the middle)
 # The look-arounds stop it matching inside a longer word.
 _PREFIX_COORD_RE = re.compile(
     r"(?<![A-Z0-9])([NS])(\d{4}|\d{6})\s?([EW])(\d{5}|\d{7})(?![A-Z0-9])"
 )
 
-# NEW: a named fix with its coordinate in brackets:
+# A named fix with its coordinate in brackets:
 #   CG1(253957N1095707E)  /  CG3 (275120N1105724E)
 # (runs AFTER the line above, so the coord is already letter-last here)
 _NAMED_COORD_RE = re.compile(
     r"\b[A-Z0-9]{2,5}\s*\(\s*(\d{4}(?:\d{2})?[NS]\d{5}(?:\d{2})?[EW])\s*\)"
 )
 
-# NEW: "CHANGDE NDB 'CD'" / "LAIBIN VOR 'LBN'" -> we only want the ID ('CD', 'LBN')
+# "CHANGDE NDB 'CD'" / "LAIBIN VOR 'LBN'" -> we only want the ID ('CD', 'LBN')
 _NAVAID_RE = re.compile(
     r"\b[A-Z]+\s+(?:DVOR/DME|VOR/DME|DVOR|VOR|NDB)\s*['\"]([A-Z0-9]{2,5})['\"]"
 )
 
-# NEW: end of an "ADJUST TO" route that is NOT part of the route itself:
+# NEW: navaid type written AFTER the ID with no quotes:
+#   "IKA DVOR/DME"  -> "IKA"      "HAM VOR" -> "HAM"
+_NAVAID_SUFFIX_RE = re.compile(
+    r"\b([A-Z]{2,3})\s+(?:DVOR/DME|VOR/DME|DVOR|VOR|NDB)\b(?!\s*['\"])"
+)
+
+# End of an "ADJUST TO" route that is NOT part of the route itself:
 #   "... TO BEYOND ABTUD"  /  "... FOR BEYOND LBN"  /  "... FOR ARR ZGGG"
 _ROUTE_TAIL_RE = re.compile(r"\b(?:FOR|TO)\s+(?:BEYOND|ARR|DEP)\b.*$")
+
+# NEW: closure sentence, e.g.
+#   "AWY G208/L125 BTN RADAL AND IKA CLSD"
+#   "AIRWAY N39 BTN DEMBA AND OBRIX CLSD"
+#   "ATS ROUTE A1 SEGMENT BTN X AND Y"
+# group 1 = airway(s)  (can be several joined by "/")
+# group 2 = from fix,  group 3 = to fix
+_CLOSURE_RE = re.compile(
+    r"\b(?:AWY|AIRWAY|ATS\s+ROUTE)S?\s+"
+    r"([A-Z]{1,2}\d{1,4}[A-Z]?(?:\s*/\s*[A-Z]{1,2}\d{1,4}[A-Z]?)*)\s+"
+    r"(?:SEGMENT\s+)?BTN\s+([A-Z0-9]{2,15})\s+AND\s+([A-Z0-9]{2,15})"
+)
+
+# NEW: a DCT chain anywhere in the text:
+#   "ROVAD DCT IKA"
+#   "ULDUS DCT ALKUP DCT IMLIM DCT OXADU M715 OBRIX"
+# = waypoint, then one or more (DCT or AIRWAY) + waypoint
+_CHAIN_WP = r"[A-Z0-9]{2,15}"
+_CHAIN_LINK = r"(?:DCT|[A-Z]{1,2}\d{1,4}[A-Z]?)"
+_CHAIN_RE = re.compile(
+    rf"(?<![A-Z0-9])({_CHAIN_WP}(?:\s+{_CHAIN_LINK}\s+{_CHAIN_WP})+)(?![A-Z0-9])"
+)
+
+# NEW: direction words in front of a route ("FOR WESTBOUND:", "EB")
+_DIR_WORD_RE = re.compile(r"\b(WEST|EAST|NORTH|SOUTH)BOUND\b|\b(WB|EB|NB|SB)\b")
 
 # Airway name: 1-2 letters + 1-4 digits + optional letter (L642, UL888, W15)
 _AWY_TOK_RE = re.compile(r"^[A-Z]{1,2}\d{1,4}[A-Z]?$")
@@ -81,21 +112,23 @@ _NOISE = {
     "ON", "VIA", "CHANGE", "FM", "FROM", "DEVIATE", "LEFT", "RIGHT",
     "SEE", "NOTAM", "FREE", "MET", "BALLOON", "BE", "OPERATED",
     "MENTIONED", "SEGMENTS", "BELOW", "SHALL", "ACT",
-    # NEW: word that can sit in front of a route
+    # word that can sit in front of a route
     "ROUTE",
+    # NEW: Iran-style words that can end up next to a DCT chain
+    "FPL", "FILE", "TOS", "MNM", "LVL", "FLT", "DVOR", "DME", "AWY", "AIRWAY",
 }
 
 
 def _normalize_coords(text):
     """
-    NEW. Rewrites every coordinate into the ONE format the rest of the
+    Rewrites every coordinate into the ONE format the rest of the
     tool already understands (letter LAST, no spaces):
 
         N253957E1095707        -> 253957N1095707E
         N275120 E1105724       -> 275120N1105724E
         CG1(N253957E1095707)   -> 253957N1095707E   (name dropped, coord kept)
 
-    Because it runs once at the start, every style (A-H) and
+    Because it runs once at the start, every style and
     waypoint_resolver.py get the fix for free - nothing else changes.
     """
     # Step 1: move N/S and E/W to the end, remove the space
@@ -105,6 +138,36 @@ def _normalize_coords(text):
     # Step 2: "CG1(coord)" -> "coord"
     text = _NAMED_COORD_RE.sub(r"\1", text)
     return text
+
+
+def _find_closures(text):
+    """
+    NEW. Finds every "AWY X BTN A AND B" closure sentence in the text.
+    Returns a list of (airway, (A, B)).
+      "AWY G208/L125 BTN RADAL AND IKA CLSD" -> ("G208/L125", ("RADAL", "IKA"))
+    Navaid words (DVOR/DME...) must already be removed from the text.
+    """
+    out = []
+    for m in _CLOSURE_RE.finditer(text):
+        awy = re.sub(r"\s+", "", m.group(1))         # "G208 / L125" -> "G208/L125"
+        out.append((awy, (m.group(2), m.group(3))))
+    return out
+
+
+def _pick_closure(closures, waypoints):
+    """
+    NEW. Which closure belongs to this route?
+      1. one whose end fix (A or B) is IN the route  -> that one
+      2. otherwise, if the NOTAM has only ONE closure -> that one
+      3. otherwise we don't guess                     -> (None, None)
+    """
+    wset = set(waypoints)
+    for awy, seg in closures:
+        if seg[0] in wset or seg[1] in wset:
+            return awy, seg
+    if len(closures) == 1:
+        return closures[0]
+    return None, None
 
 
 def _clean(s):
@@ -238,7 +301,8 @@ def extract_reroutes(e_text):
     Returns a list of reroute dicts.
     Styles: A Damascus OVF | B ALTN RTE: | C numbered 'X TO Y:' |
             D standalone dash | E VOR adjust | F numbered + ALTN RTE |
-            G '+' bullet route | H 'VIA ... : CHANGE TO ...'
+            G '+' bullet route | H 'VIA ... : CHANGE TO ...' |
+            I DCT chain anywhere (Iran style)  <- NEW
 
     Each dict has:
       "cr"               -> True = forced route, plot it
@@ -247,7 +311,7 @@ def extract_reroutes(e_text):
       "segment_inferred" -> True if we guessed the segment from the CR ends
                             (NOTAM didn't say it directly)
     """
-    # NEW: put every coordinate into one format BEFORE any style runs
+    # Put every coordinate into one format BEFORE any style runs
     e_text = _normalize_coords(e_text)
 
     results = []
@@ -393,18 +457,14 @@ def extract_reroutes(e_text):
     for vl in re.findall(
         r"ADJUST\s+TO\s+([^\n\.]+?)(?:,\s*AND\s+VICE\s+VERSA|\.|$)", joined, re.I
     ):
-        # CHANGED: we used to keep ONLY the quoted IDs ('SJG', 'LBN') and throw
-        # away everything else - so normal fixes (MILOP, IRSAS) and coordinates
-        # got lost, and the route never became a CR.
-        # Now we swap "NAME VOR 'ID'" for just ID, and read the whole route.
-        body = _NAVAID_RE.sub(r"\1", vl)                       # SANJIANG VOR 'SJG' -> SJG
+        # Swap "NAME VOR 'ID'" for just ID, then read the whole route
+        body = _NAVAID_RE.sub(r"\1", vl)                          # SANJIANG VOR 'SJG' -> SJG
         body = re.sub(r"['\"]([A-Z0-9]{2,5})['\"]", r"\1", body)  # leftover 'HAM' -> HAM
 
-        # NEW: "FOR ARR ZGGG" -> ZGGG is the destination airport, not a waypoint
+        # "FOR ARR ZGGG" -> ZGGG is the destination airport, not a waypoint
         arr_apts = re.findall(r"\bARR\s+([A-Z]{4})\b", body)
 
-        # NEW: cut off "TO BEYOND X" / "FOR BEYOND X" / "FOR ARR X"
-        # (otherwise X gets added twice at the end of the route)
+        # Cut off "TO BEYOND X" / "FOR BEYOND X" / "FOR ARR X"
         body = _ROUTE_TAIL_RE.sub("", body)
 
         wps = _only_waypoints(_tokenize(body))
@@ -430,6 +490,52 @@ def extract_reroutes(e_text):
                     "closed_segment": None, "from_airports": [], "to_airports": [],
                     "cr": _is_cr(wps, line),
                 })
+
+    # ---------- NEW Style I: DCT chain anywhere (Iran style) ----------
+    #   "... SHALL FILE FPL VIA ROVAD DCT IKA DVOR/DME,"
+    #   "- ALTN TOS FOR WESTBOUND: RADAL DCT IMKER DCT ULDUS,"
+    # Runs LAST, and only adds routes the other styles didn't already catch,
+    # so it can never change what Styles A-H give.
+    txt_i = _NAVAID_SUFFIX_RE.sub(r"\1", joined)         # "IKA DVOR/DME" -> "IKA"
+    closures = _find_closures(txt_i)                     # "AWY X BTN A AND B" sentences
+    already = {tuple(r["waypoints"]) for r in results}   # routes other styles found
+    prev_end = 0
+    for m in _CHAIN_RE.finditer(txt_i):
+        chain = m.group(1)
+
+        # Must contain a DCT - "A M715 B" alone is not a CR
+        if not re.search(r"\bDCT\b", chain):
+            continue
+
+        wps = _only_waypoints(_tokenize(chain))
+        if len(wps) < 2 or tuple(wps) in already:
+            prev_end = m.end()
+            continue
+
+        # Direction word just before this route ("FOR WESTBOUND:" -> WB)
+        before = txt_i[prev_end:m.start()]
+        dirs = list(_DIR_WORD_RE.finditer(before))
+        hint = None
+        if dirs:
+            d = dirs[-1]
+            hint = (d.group(1)[0] + "B") if d.group(1) else d.group(2)
+
+        # "AND VICE VERSA" / "BIDIRECTIONAL" just after the route
+        after = txt_i[m.end(): m.end() + 40]
+        bidir = bool(re.search(r"VICE\s+VERSA|BIDIRECTIONAL", after))
+
+        # Which closed airway this route replaces
+        awy, seg = _pick_closure(closures, wps)
+
+        results.append({
+            "raw": _clean(chain), "tokens": wps, "waypoints": wps,
+            "bidirectional": bidir, "direction_hint": hint,
+            "closed_airway": awy, "closed_segment": seg,
+            "from_airports": [], "to_airports": [],
+            "cr": True,
+        })
+        already.add(tuple(wps))
+        prev_end = m.end()
 
     # ---------- Make sure every dict has every key ----------
     for r in results:
@@ -468,9 +574,8 @@ def extract_reroutes(e_text):
     ]
 
     # ---------- Final: remove exact duplicates ----------
-    # CHANGED: airports are no longer part of the key, so the same route
-    # caught by 2 styles (one with "ARR ZGGG", one without) shows only once.
-    # The first one found (the one WITH the airport) is kept.
+    # Airports are not part of the key, so the same route caught by 2 styles
+    # (one with "ARR ZGGG", one without) shows only once.
     seen, out = set(), []
     for r in filtered:
         key = (tuple(r["waypoints"]), r["bidirectional"], r["closed_airway"])
