@@ -59,8 +59,8 @@ with st.sidebar:
     )
     min_dist = st.slider("Min ray distance (km)", 0, 1000, 0, 50)
     corridor = st.slider(
-        "Corridor half-angle (°)", 15, 90, 90, 5,
-        help="90° = everything ahead vs behind (matches manual FPID logic)."
+        "Search slice half-angle (°)", 15, 90, 45, 5,
+        help="±45° around the reference line (closed segment extended outward)."
     )
 
     st.caption("Source FIR is auto-excluded. Nearest countries shown first.")
@@ -196,9 +196,44 @@ if analysis:
         coords = [r["coord"] for r in out["resolved"] if r["coord"]]
         if coords:
             center = coords[len(coords)//2]
-            m = folium.Map(location=center, zoom_start=4, tiles="cartodbpositron")
+            m = folium.Map(location=center, zoom_start=4, tiles=None)
 
-            folium.PolyLine(coords, color="black", weight=4).add_to(m)
+            folium.TileLayer(
+                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/"
+                      "World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+                attr="Tiles © Esri", name="Street", max_zoom=16,
+            ).add_to(m)
+
+            folium.TileLayer(
+                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/"
+                      "Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+                attr="Tiles © Esri", name="Light Gray", max_zoom=16,
+            ).add_to(m)
+
+            folium.TileLayer(
+                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/"
+                      "World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                attr="Tiles © Esri", name="Satellite", max_zoom=16,
+            ).add_to(m)
+
+            folium.PolyLine(coords, color="black", weight=4,
+                            tooltip="CR / reroute").add_to(m)
+
+            ref = [c for _, c in out.get("reference_path", [])]
+            if ref:
+                folium.PolyLine(ref, color="#1e90ff", weight=5, dash_array="8",
+                                tooltip=f"Closed segment ({out['reference_source']})").add_to(m)
+
+            dep_slice  = cls["slice_last"]  if dep_is_last else cls["slice_first"]
+            dest_slice = cls["slice_first"] if dep_is_last else cls["slice_last"]
+            if dep_slice:
+                folium.Polygon(dep_slice, color="red", weight=1,
+                               fill=True, fill_opacity=0.08,
+                               tooltip="Dep search slice").add_to(m)
+            if dest_slice:
+                folium.Polygon(dest_slice, color="blue", weight=1,
+                               fill=True, fill_opacity=0.08,
+                               tooltip="Dest search slice").add_to(m)
             folium.Marker(coords[0],  icon=folium.Icon(color="green"),
                           popup=f"FIRST: {out['first_wpt']}").add_to(m)
             folium.Marker(coords[-1], icon=folium.Icon(color="red"),
@@ -225,7 +260,7 @@ if analysis:
                 "🔵 Blue circles = **Dest. Airports** side  |  "
                 "⚫ Black line = reroute path"
             )
-
+            folium.LayerControl(collapsed=True).add_to(m)
             st_folium(m, height=500, key=f"map_{i}", returned_objects=[])
 
             # Show optimizer-resolved reroutes
