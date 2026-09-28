@@ -17,8 +17,7 @@ def parse_coord_token(tok):
     if ns == 'S': lat = -lat
     if ew == 'W': lon = -lon
     return (round(lat, 6), round(lon, 6))
-# raw lat/long fixes in NOTAM text: 3105N12452E or 310530N1245212E
-_COORD_TOKEN_RE = re.compile(r"^(\d{2})(\d{2})(\d{2})?([NS])(\d{3})(\d{2})(\d{2})?([EW])$")
+
 
 
 def _parse_dms(coord_str):
