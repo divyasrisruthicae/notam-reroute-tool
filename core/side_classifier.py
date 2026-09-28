@@ -109,9 +109,13 @@ def _hit(geom, slc, slc_prep, o_lat, o_lon, ray_brg):
         return None
     near = nearest_points(inter, Point(o_lon, o_lat))[0]
     rep = inter.representative_point()
+    # NEW: centre of the WHOLE FIR (not just the part inside the slice).
+    # Used later to decide which side a country belongs to if it hits both.
+    fc = geom.centroid
     return {
         "distance_km": _haversine_km(o_lat, o_lon, near.y, near.x),
         "centroid": (rep.y, rep.x),     # point of the FIR inside the slice
+        "fir_centroid": (fc.y, fc.x),   # NEW: centre of the whole FIR
         "bearing_diff": _angular_diff(
             _bearing_deg(o_lat, o_lon, rep.y, rep.x), ray_brg),
     }

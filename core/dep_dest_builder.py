@@ -11,8 +11,41 @@ CHANGED: the 45 deg search slices now hang off the CR ITSELF:
 The closed airway segment is no longer used for the slices,
 so _reference_path() and _km() were removed.
 """
-from .side_classifier import classify_firs_directional
 
+from .side_classifier import classify_firs_directional, _haversine_km
+
+
+def _one_side_only(classification, first_pt, last_pt):
+    """
+    NEW. A country can't be on BOTH the Dep and Dest side.
+    If a prefix (e.g. VO) was found on both sides, keep it only on the side
+    whose end waypoint is CLOSER to the centre of that FIR:
+        VO centre is nearer NNP (last)  -> keep in Dest, remove from Dep
+    """
+    first = classification["beyond_first"]
+    last = classification["beyond_last"]
+
+    # Prefixes found on both sides
+    shared = {x["prefix"] for x in first} & {x["prefix"] for x in last}
+    if not shared:
+        return
+
+    drop_first, drop_last = set(), set()
+    for p in shared:
+        # Centres of every FIR with this prefix (VO may have more than one)
+        cents = [x["fir_centroid"] for x in first + last if x["prefix"] == p]
+        d_first = min(_haversine_km(first_pt[0], first_pt[1], c[0], c[1]) for c in cents)
+        d_last = min(_haversine_km(last_pt[0], last_pt[1], c[0], c[1]) for c in cents)
+        if d_first <= d_last:
+            drop_last.add(p)      # nearer the FIRST end -> remove from LAST side
+        else:
+            drop_first.add(p)     # nearer the LAST end  -> remove from FIRST side
+
+    # Take them off the losing side (list, prefixes, and map circles all follow)
+    classification["beyond_first"] = [x for x in first if x["prefix"] not in drop_first]
+    classification["beyond_last"] = [x for x in last if x["prefix"] not in drop_last]
+    classification["prefixes_first"] = sorted({x["prefix"] for x in classification["beyond_first"]})
+    classification["prefixes_last"] = sorted({x["prefix"] for x in classification["beyond_last"]})
 
 def star_prefixes(codes):
     """
@@ -118,6 +151,10 @@ def build_dep_dest(reroute, wp_res, fir_res, pfx_res,
     elif ad_flow == "DEP":
         _blank("first")
         _blank("last")
+
+    # NEW: same country never on both sides - keep it on its nearer side.
+    # Runs AFTER the aerodrome blanking, so a blanked side never "steals" a country.
+    _one_side_only(classification, ref_coords[0], ref_coords[-1])
 
     # Airports named in the NOTAM text (e.g. Style C "ZGGG TO ZBAA")
     from_airports = reroute.get("from_airports", [])
