@@ -38,6 +38,41 @@ def ordered_prefixes(items, extra_airports):
             seen.append(a)
     return seen
 
+import urllib.parse   # NEW: used to build the SkyVector link
+
+
+def skyvector_url(rr, out, chart=304, zoom=5):
+    """
+    NEW. Builds a SkyVector flight-plan link for this reroute.
+    Three things matter, or SkyVector guesses wrong:
+      1. NO "DCT" tokens - SkyVector doesn't understand them and
+         silently drops the fix that comes after.
+      2. ll=lat,lon  - centres the map on OUR route, otherwise it
+         matches same-named fixes on the other side of the world
+         (CEA -> KCEA in the USA).
+      3. chart=304 (World Hi) + zoom, so the enroute chart opens.
+    Result:
+      https://skyvector.com/?ll=21.53,86.71&chart=304&zoom=5&fpl=CEA G450 JJS JRS VVZ
+    """
+    # Keep the NOTAM's own order (waypoints AND airways), drop DCT
+    toks = [t for t in rr.get("raw", "").replace("-", " ").split()
+            if t.upper() != "DCT"]
+    if not toks:
+        toks = out.get("waypoints", [])          # fallback
+    if not toks:
+        return None
+
+    # Centre = middle of the resolved coordinates we already have
+    pts = [r["coord"] for r in out.get("resolved", []) if r.get("coord")]
+    params = {"chart": str(chart), "zoom": str(zoom), "fpl": " ".join(toks)}
+    if pts:
+        lat = sum(p[0] for p in pts) / len(pts)
+        lon = sum(p[1] for p in pts) / len(pts)
+        # ll must come FIRST in the link, like the working example
+        params = {"ll": f"{lat},{lon}", **params}
+
+    return "https://skyvector.com/?" + urllib.parse.urlencode(params)
+
 # NEW: short text like "DEP OEJN → ARR OEDF" for aerodrome NOTAMs
 def ad_flow_label(rr):
     if not rr.get("ad_flow"):
@@ -244,7 +279,15 @@ if analysis:
         )
         st.markdown(f"**Copyable output (Reroute {i})**")
         st.code(summary, language="text")
-
+        # ---- SkyVector link (opens the same route on their chart) ----
+        sv = skyvector_url(rr, out)
+        if sv:
+            st.markdown(
+                f"🗺️ [**SkyVector**]({sv}) "
+                f"<span style='color:#888;font-size:0.85em'>"
+                f"(opens in a new tab)</span>",
+                unsafe_allow_html=True,
+            )
         # ---- Map ----
         coords = [r["coord"] for r in out["resolved"] if r["coord"]]
         if coords:
