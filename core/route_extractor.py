@@ -75,6 +75,24 @@ _CHAIN_LINK = r"(?:DCT|[A-Z]{1,2}\d{1,4}[A-Z]?)"
 _CHAIN_RE = re.compile(
     rf"(?<![A-Z0-9])({_CHAIN_WP}(?:\s+{_CHAIN_LINK}\s+{_CHAIN_WP})+)(?![A-Z0-9])"
 )
+# NEW (A4491 Turkey): "M/UM11" or "L/UL851" -> keep only the upper airway "UM11"
+_AWY_SLASH_RE = re.compile(r"\b[A-Z]{1,2}/([A-Z]{1,2}\d{1,4}[A-Z]?)\b")
+
+# NEW (A4491): a dash between two names -> a space
+#   "UDROS-DCT-CRM-DCT-ROLIN" -> "UDROS DCT CRM DCT ROLIN"
+# Needs a letter/digit on BOTH sides, so " - " with spaces is not touched
+_DASH_JOIN_RE = re.compile(r"(?<=[A-Z0-9])-(?=[A-Z0-9])")
+
+# NEW (A4491): closure written "AWY UM860 KUGOS CRM SEGMENT CLSD"
+# (runs AFTER the two lines above, so the dash and slash are already gone)
+_SEG_CLOSURE_RE = re.compile(
+    r"\b(?:AWY|AIRWAY)S?\s+([A-Z]{1,2}\d{1,4}[A-Z]?)\s+"
+    r"([A-Z0-9]{2,5})\s+([A-Z0-9]{2,5})\s+SEGMENT\b"
+)
+
+# NEW (A4491): direction written AFTER the route: "... ROLIN VIA EASTBOUND"
+_DIR_AFTER_RE = re.compile(r"^\s*(?:VIA|FOR)\s+(WEST|EAST|NORTH|SOUTH)BOUND\b")
+
 
 # Direction words in front of a route ("FOR WESTBOUND:", "EB")
 _DIR_WORD_RE = re.compile(r"\b(WEST|EAST|NORTH|SOUTH)BOUND\b|\b(WB|EB|NB|SB)\b")
@@ -243,7 +261,10 @@ def _is_waypoint(tok):
         return True
     if t in _NOISE:
         return False
-    if re.match(r"^[A-Z]\d{1,4}$", t):      # airway: A412, G450, W41, N895
+    # CHANGED: was "^[A-Z]\d{1,4}$", which only caught 1-letter airways (J21, W15).
+    # # Upper-airspace airways have TWO letters (UT37, UT151, UM206, UL655, UJ11)
+    # # and were being read as waypoints. _AWY_TOK_RE covers both.
+    if _AWY_TOK_RE.match(t): # airway: A412, W41, UT37, UL655
         return False
     if re.match(r"^F?L?\d{2,4}$", t):       # flight level: FL350, 350
         return False
@@ -433,6 +454,7 @@ def extract_reroutes(e_text):
         c = _CHANGE_RE.search(line)
         if c:
             _ctx, old, new = c.groups()
+            # CHANGED (B1974): Mexico writes "(BOTH WAYS)" instead of "VICE VERSA"
             bidir = bool(re.search(r"VICE\s+VERSA", new, re.I))
             new_txt = re.sub(r"\bAND\s+VICE\s+VERSA\b", "", new, flags=re.I)
             w, a, ap = _split_tokens(new_txt)       # new route pieces
@@ -532,6 +554,16 @@ def extract_reroutes(e_text):
     # so it can never change what Styles A-H give.
     txt_i = _NAVAID_SUFFIX_RE.sub(r"\1", joined)         # "IKA DVOR/DME" -> "IKA"
     closures = _find_closures(txt_i)                     # "AWY X BTN A AND B" sentences
+
+    # NEW (A4491 Turkey): "M/UM11" -> "UM11", then "A-DCT-B" -> "A DCT B".
+    # Done AFTER the old closures are read, so Iran/Saudi closures don't change.
+    txt_i = _AWY_SLASH_RE.sub(r"\1", txt_i)
+    txt_i = _DASH_JOIN_RE.sub(" ", txt_i)
+
+    # NEW (A4491): "AWY X A-B SEGMENT CLSD" closures, with their position
+    # in the text, so each route can use the closure written just before it
+    seg_closures = [(cm.start(), cm.group(1), (cm.group(2), cm.group(3)))
+                    for cm in _SEG_CLOSURE_RE.finditer(txt_i)]
     ad_flow, ad_apt = _find_ad_flow(txt_i)               # NEW: "INBD TFC TO OEJN" etc.
     already = {tuple(r["waypoints"]) for r in results}   # routes other styles found
     prev_end = 0
@@ -543,7 +575,17 @@ def extract_reroutes(e_text):
         # labels them "optimizer-resolved" so the analyst can decide.
 
         wps = _only_waypoints(_tokenize(chain))
+        # NEW (A4491): the "SEGMENT CLSD" closure written closest BEFORE this route
+        prev_cl = [c for c in seg_closures if c[0] < m.start()]
+        near_cl = (prev_cl[-1][1], prev_cl[-1][2]) if prev_cl else None
+
         if len(wps) < 2 or tuple(wps) in already:
+            # NEW (A4491): Style D may already have caught this route, but
+            # without its closed airway. Fill that in, and change nothing else.
+            if len(wps) >= 2 and near_cl:
+                for r in results:
+                    if tuple(r["waypoints"]) == tuple(wps) and not r["closed_airway"]:
+                        r["closed_airway"], r["closed_segment"] = near_cl
             prev_end = m.end()
             continue
 
@@ -555,12 +597,23 @@ def extract_reroutes(e_text):
             d = dirs[-1]
             hint = (d.group(1)[0] + "B") if d.group(1) else d.group(2)
 
+        # NEW (A4491): "... ROLIN VIA EASTBOUND" -> direction AFTER the route.
+        # This wins over the word before, because the text before this route
+        # can hold the PREVIOUS route's "VIA EASTBOUND".
+        da = _DIR_AFTER_RE.match(txt_i[m.end():])
+        if da:
+            hint = da.group(1)[0] + "B"
+
         # "AND VICE VERSA" / "BIDIRECTIONAL" just after the route
         after = txt_i[m.end(): m.end() + 40]
-        bidir = bool(re.search(r"VICE\s+VERSA|BIDIRECTIONAL", after))
+        # CHANGED (B1974): Mexico writes "(BOTH WAYS)" instead of "VICE VERSA"
+        bidir = bool(re.search(r"VICE\s+VERSA|BIDIRECTIONAL|BOTH\s+WAYS", after))
 
         # Which closed airway this route replaces
         awy, seg = _pick_closure(closures, wps)
+        # NEW (A4491): no "BTN" closure found -> use the nearest "SEGMENT CLSD" one
+        if awy is None and near_cl:
+            awy, seg = near_cl
 
         results.append({
             "raw": _clean(chain), "tokens": wps, "waypoints": wps,

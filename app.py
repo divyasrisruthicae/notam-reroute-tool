@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
@@ -202,8 +203,16 @@ if analysis:
         else:
             st.warning("⚙️ **Optimizer-resolved** — airway route (wpt - AWY - wpt), "
                        "fixes in between not listed. Analyst to check before use.")
-
-        st.code(rr["raw"])
+        # NEW (display only): "M/UM11" in the NOTAM = lower M11 + upper UM11.
+        # Same path on the ground, so it's drawn once. We just add a note.
+        # Reads the pasted NOTAM text, so the parser is not touched.
+        pairs = re.findall(r"\b([A-Z]{1,2})/([A-Z]{1,2})(\d{1,4}[A-Z]?)\b",
+                           st.session_state.get("last_notam", ""))
+        dual = [f"{lo + n} / {up + n}" for lo, up, n in pairs
+                if (up + n) in rr["raw"].split()]      # only airways in THIS route
+        dual = list(dict.fromkeys(dual))                # remove duplicates
+        note = f"   (2 routes: {', '.join(dual)})" if dual else ""
+        st.code(rr["raw"] + note)
 
         # NEW: aerodrome NOTAM -> traffic always flies FIRST -> LAST
         # (e.g. TOKRA ... BOSUT -> OEJN), so Dep = START side whatever the
