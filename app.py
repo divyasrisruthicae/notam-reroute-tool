@@ -236,7 +236,11 @@ if analysis:
             st.error(f"❌ {out['error']}. Missing: {out['missing_waypoints']}")
             continue
         if out["missing_waypoints"]:
-            st.warning(f"⚠️ Unresolved waypoints: `{', '.join(out['missing_waypoints'])}`")
+            st.warning(
+                f"⚠️ `{', '.join(out['missing_waypoints'])}` not found in the waypoint data. "
+                f"If it is the first or last waypoint, the Dep/Dest airports for that end "
+                f"were worked out from the previous leg. Analyst to check."
+            )
 
         cls = out["classification"]
 

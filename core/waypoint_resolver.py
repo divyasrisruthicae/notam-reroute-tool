@@ -70,7 +70,10 @@ class WaypointResolver:
                     coord_col = df.columns[-1]
         self.coord_col = coord_col
 
-        df = df[df["NDID"].astype(str).str.match(r"^[A-Z0-9]+$", na=False)]
+        # CHANGED: trim spaces BEFORE checking the name, so a cell like "KC "
+        # isn't thrown away (it used to be dropped silently)
+        df["NDID"] = df["NDID"].astype(str).str.strip()
+        df = df[df["NDID"].str.match(r"^[A-Z0-9]+$", na=False)]
         df["NDID_U"] = df["NDID"].str.upper().str.strip()
         df["NDIC_U"] = df["NDIC"].str.upper().str.strip()
         df["COORDVAL"] = df[coord_col].astype(str).map(_parse_dms)
