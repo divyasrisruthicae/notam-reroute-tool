@@ -558,6 +558,13 @@ def extract_reroutes(e_text):
     # NEW (A4491 Turkey): "M/UM11" -> "UM11", then "A-DCT-B" -> "A DCT B".
     # Done AFTER the old closures are read, so Iran/Saudi closures don't change.
     txt_i = _AWY_SLASH_RE.sub(r"\1", txt_i)
+
+    # NEW (A3241 India): fix a stray space on ONE side of a dash
+    #   "TTP-DCT- GUANI" -> "TTP-DCT-GUANI"     "TTP -DCT" -> "TTP-DCT"
+    # A space on BOTH sides (" - ") is left alone, so Vietnam bullets don't change.
+    txt_i = re.sub(r"(?<=[A-Z0-9])-\s+(?=[A-Z0-9])|(?<=[A-Z0-9])\s+-(?=[A-Z0-9])",
+                   "-", txt_i)
+
     txt_i = _DASH_JOIN_RE.sub(" ", txt_i)
 
     # NEW (A4491): "AWY X A-B SEGMENT CLSD" closures, with their position
