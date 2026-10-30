@@ -244,6 +244,13 @@ if analysis:
 
         cls = out["classification"]
 
+        # TEMP DEBUG: show what the tool thinks the KZ FIR is. Delete after.
+        for side in ("beyond_first", "beyond_last"):
+            for it in cls[side]:
+                if it["prefix"] == "KZ":
+                    st.caption(f"🔧 {side}: {it['fir_code']} centroid={it['centroid']} "
+                               f"dist={it['distance_km']:.0f}km")
+
         # ---- Assign Dep/Dest ITEMS based on toggle (sorted nearest-first) ----
         if dep_is_last:
             dep_items   = sorted(cls["beyond_last"],  key=lambda x: x["distance_km"])
